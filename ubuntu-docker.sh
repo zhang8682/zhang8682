@@ -147,6 +147,41 @@ check_root() {
     fi
 }
 
+# ==================== 新增：安装日志记录 ====================
+log_install_step() {
+    local component="$1"
+    local step="$2"
+    local status="$3"  # "start", "success", "error"
+    local message="${4:-}"
+    
+    local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    local log_msg="[$timestamp] INSTALL $component - 步骤: $step - 状态: $status"
+    [ -n "$message" ] && log_msg+=" - $message"
+    
+    echo "$log_msg" >> "$LOG_FILE"
+    
+    case $status in
+        "start") printf "${CYAN}[→]${NC} %s\n" "$step" ;;
+        "success") printf "${GREEN}[✓]${NC} %s\n" "$step" ;;
+        "error") printf "${RED}[✗]${NC} %s\n" "$step" ;;
+    esac
+}
+
+# 简化进度跟踪
+simple_progress() {
+    local task="$1"
+    local func="$2"
+    
+    printf "${CYAN}[ℹ]${NC} 开始: $task\n"
+    if $func; then
+        printf "${GREEN}[✓]${NC} 完成: $task\n"
+        return 0
+    else
+        printf "${RED}[✗]${NC} 失败: $task\n"
+        return 1
+    fi
+}
+
 # 检测命令是否存在
 command_exists() {
     type "$1" &> /dev/null
@@ -213,6 +248,90 @@ confirm_danger() {
         return 0
     else
         printf "${YELLOW}操作已取消${NC}\n"
+        return 1
+    fi
+}
+
+# ==================== 新增：进度条显示函数 ====================
+show_progress_bar() {
+    local current="$1"
+    local total="$2"
+    local message="${3:-安装进度}"
+    local width=50
+    local percentage=$((current * 100 / total))
+    local completed=$((current * width / total))
+    local remaining=$((width - completed))
+    
+    # 构建进度条
+    local progress_bar="["
+    for ((i=0; i<completed; i++)); do
+        progress_bar+="${GREEN}█${NC}"
+    done
+    for ((i=0; i<remaining; i++)); do
+        progress_bar+="${GRAY}░${NC}"
+    done
+    progress_bar+="]"
+    
+    printf "\r${CYAN}[ℹ]${NC} %-30s %s %3d%% (%d/%d)" "$message" "$progress_bar" "$percentage" "$current" "$total"
+}
+
+show_step_progress() {
+    local step_num="$1"
+    local total_steps="$2"
+    local message="$3"
+    local status="$4"  # "start", "success", "error"
+    
+    case $status in
+        "start")
+            printf "\n${CYAN}[→]${NC} 步骤 %d/%d: %s..." "$step_num" "$total_steps" "$message"
+            ;;
+        "success")
+            printf "\r${GREEN}[✓]${NC} 步骤 %d/%d: %s 完成\n" "$step_num" "$total_steps" "$message"
+            ;;
+        "error")
+            printf "\r${RED}[✗]${NC} 步骤 %d/%d: %s 失败\n" "$step_num" "$total_steps" "$message"
+            ;;
+    esac
+}
+
+# 增强版安装进度跟踪
+track_install_progress() {
+    local component="$1"
+    local total_steps="$2"
+    local step_func="$3"
+    local progress_pid=""
+    
+    printf "\n${BOLD}开始安装 $component...${NC}\n"
+    
+    # 创建临时进度指示器
+    (
+        local dots=0
+        while true; do
+            local dot_str=""
+            for ((i=0; i<dots; i++)); do
+                dot_str+="."
+            done
+            printf "\r${GRAY}等待中$dot_str   ${NC}"
+            sleep 0.5
+            dots=$(((dots + 1) % 4))
+        done
+    ) &
+    
+    progress_pid=$!
+    disown $progress_pid
+    
+    # 执行安装函数
+    local result=1
+    $step_func && result=0
+    
+    # 停止进度指示器
+    kill $progress_pid 2>/dev/null
+    
+    if [ $result -eq 0 ]; then
+        printf "\r${GREEN}[✓] $component 安装完成！${NC}\n"
+        return 0
+    else
+        printf "\r${RED}[✗] $component 安装失败！${NC}\n"
         return 1
     fi
 }
@@ -389,6 +508,7 @@ stop_progress() {
 }
 
 # ==================== 状态检测函数（带缓存）====================
+# 修复状态检测模块
 update_status_cache() {
     local now=$(date +%s)
     local cache_age=$((now - CACHE_STATUS["last_update"]))
@@ -428,14 +548,38 @@ update_status_cache() {
         
         # === 新增：缓存磁盘使用情况（Docker专用）===
         CACHE_STATUS["disk_usage"]=$(docker system df --format 'table {{.Type}}\t{{.TotalCount}}\t{{.Size}}' 2>/dev/null || echo "")
+        
+        # 检测 Portainer
+        if docker ps -a --format '{{.Names}}' | grep -q portainer; then
+            CACHE_STATUS["portainer_installed"]=true
+        fi
+        
+        # 检测 NPM
+        if docker ps -a --format '{{.Names}}' | grep -q nginx-proxy-manager; then
+            CACHE_STATUS["npm_installed"]=true
+        fi
+        
+        # 检测 DPanel
+        if docker ps -a --format '{{.Names}}' | grep -q dpanel; then
+            CACHE_STATUS["dpanel_installed"]=true
+        fi
+    fi
+    
+    # 检测 Docker Compose
+    if command_exists docker-compose; then
+        CACHE_STATUS["compose_installed"]=true
+        CACHE_STATUS["compose_version"]=$(docker-compose --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')
+    elif command_exists docker; then
+        # 检查是否安装了 Docker Compose Plugin
+        if docker compose version >/dev/null 2>&1; then
+            CACHE_STATUS["compose_installed"]=true
+            CACHE_STATUS["compose_version"]=$(docker compose version 2>/dev/null | awk '{print $4}')
+        fi
     fi
     
     # === 新增：缓存系统信息 ===
-    CACHE_STATUS["system_load"]=$(uptime | awk -F'load average:' '{print $2}' | tr -d ' ')
-    CACHE_STATUS["memory_info"]=$(free -m | awk 'NR==2 {printf "总:%dMB 用:%dMB 剩:%dMB", $2, $3, $7}')
-    
-    # 其他现有的检测代码保持不变...
-    # ...
+    CACHE_STATUS["system_load"]=$(uptime | awk -F'load average:' '{print $2}' | tr -d ' ' 2>/dev/null || echo "未知")
+    CACHE_STATUS["memory_info"]=$(free -m 2>/dev/null | awk 'NR==2 {printf "总:%dMB 用:%dMB 剩:%dMB", $2, $3, $7}' || echo "未知")
     
     CACHE_STATUS["last_update"]=$now
 }
@@ -882,67 +1026,99 @@ install_docker() {
     
     print_info "系统: $DISTRO_CODENAME"
     
-    # 进度显示
-    local progress_pid=$(show_progress "正在更新包列表...")
-    apt-get update > /dev/null 2>&1 || true
-    stop_progress "$progress_pid"
+    # 定义安装步骤
+    local steps=6
+    local current_step=1  # 改为从1开始
     
-    progress_pid=$(show_progress "正在安装依赖...")
-    apt-get install -y ca-certificates curl gnupg lsb-release apt-transport-https > /dev/null 2>&1 || {
-        stop_progress "$progress_pid"
-        print_error "依赖安装失败"
+    # 步骤1: 更新包列表
+    show_step_progress $current_step $steps "更新包列表" "start"
+    apt-get update > /dev/null 2>&1 || {
+        show_step_progress $current_step $steps "更新包列表" "error"
         return 1
     }
-    stop_progress "$progress_pid"
+    show_step_progress $current_step $steps "更新包列表" "success"
+    ((current_step++))  # 现在这里是2
     
-    progress_pid=$(show_progress "正在添加 Docker GPG 密钥...")
+    # 步骤2: 安装依赖
+    show_step_progress 2 $steps "安装依赖包" "start"
+    apt-get install -y ca-certificates curl gnupg lsb-release apt-transport-https > /dev/null 2>&1 || {
+        show_step_progress 2 $steps "安装依赖包" "error"
+        return 1
+    }
+    show_step_progress 2 $steps "安装依赖包" "success"
+    ((current_step++))
+    
+    # 步骤3: 添加GPG密钥
+    show_step_progress 3 $steps "添加Docker GPG密钥" "start"
     mkdir -p /etc/apt/keyrings
     curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg > /dev/null 2>&1 || {
-        stop_progress "$progress_pid"
-        print_error "GPG 密钥添加失败"
+        show_step_progress 3 $steps "添加Docker GPG密钥" "error"
         return 1
     }
     chmod a+r /etc/apt/keyrings/docker.gpg
-    stop_progress "$progress_pid"
+    show_step_progress 3 $steps "添加Docker GPG密钥" "success"
+    ((current_step++))
     
-    progress_pid=$(show_progress "正在添加 Docker 源...")
+    # 步骤4: 添加Docker源
+    show_step_progress 4 $steps "添加Docker仓库源" "start"
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/ubuntu $DISTRO_CODENAME stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
     apt-get update > /dev/null 2>&1 || {
-        stop_progress "$progress_pid"
-        print_error "APT 更新失败"
+        show_step_progress 4 $steps "添加Docker仓库源" "error"
         return 1
     }
-    stop_progress "$progress_pid"
+    show_step_progress 4 $steps "添加Docker仓库源" "success"
+    ((current_step++))
     
-    progress_pid=$(show_progress "正在安装 Docker...")
+    # 步骤5: 安装Docker
+    show_step_progress 5 $steps "安装Docker引擎" "start"
     apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin > /dev/null 2>&1 || {
-        stop_progress "$progress_pid"
-        print_error "Docker 安装失败"
+        show_step_progress 5 $steps "安装Docker引擎" "error"
         return 1
     }
-    stop_progress "$progress_pid"
+    show_step_progress 5 $steps "安装Docker引擎" "success"
+    ((current_step++))
     
-    # 启动服务
-    if has_systemd; then
-        progress_pid=$(show_progress "正在启动 Docker 服务...")
-        systemctl enable --now docker > /dev/null 2>&1 || {
-            stop_progress "$progress_pid"
-            print_error "Docker 服务启动失败"
-            return 1
-        }
-        stop_progress "$progress_pid"
-    fi
-    
-    # 用户组
-    if ! getent group docker > /dev/null; then
-        groupadd docker || print_warning "docker 组已存在"
-    fi
-    
-    local CURRENT_USER="${SUDO_USER:-$(whoami)}"
-    usermod -aG docker "$CURRENT_USER" 2>/dev/null || print_warning "无法添加用户到 docker 组"
+        # 步骤6: 启动服务
+show_step_progress $current_step $steps "启动Docker服务" "start"
+if has_systemd; then
+    systemctl enable --now docker > /dev/null 2>&1 || {
+        show_step_progress $current_step $steps "启动Docker服务" "error"
+        return 1
+    }
+fi
+
+# 用户组
+if ! getent group docker > /dev/null; then
+    groupadd docker || print_warning "docker 组已存在"
+fi
+
+local CURRENT_USER="${SUDO_USER:-$(whoami)}"
+usermod -aG docker "$CURRENT_USER" 2>/dev/null || print_warning "无法添加用户到 docker 组"
+
+show_step_progress $current_step $steps "启动Docker服务" "success"
+# 这里不要递增，因为这是最后一步
+
+# 显示进度条 - 修复这里
+show_progress_bar $steps $steps "Docker安装进度"  # 显示完整的进度
+printf "\n"
     
     print_success "Docker 安装完成！"
     print_info "请重新登录或运行 'newgrp docker' 使权限生效"
+    
+    # 验证安装
+    printf "\n${BOLD}验证安装结果：${NC}\n"
+    if docker --version >/dev/null 2>&1; then
+        local version=$(docker --version | cut -d' ' -f3 | tr -d ',')
+        printf "  ${GREEN}✓${NC} Docker 版本: $version\n"
+    else
+        printf "  ${RED}✗${NC} Docker 未正确安装\n"
+    fi
+    
+    if systemctl is-active --quiet docker 2>/dev/null || [ -S /var/run/docker.sock ]; then
+        printf "  ${GREEN}✓${NC} Docker 服务正在运行\n"
+    else
+        printf "  ${YELLOW}⚠${NC} Docker 服务未运行\n"
+    fi
     
     CACHE_STATUS["last_operation"]="安装 Docker ($(date '+%H:%M'))"
     CACHE_STATUS["last_update"]=0
@@ -1009,42 +1185,158 @@ install_nginxpm() {
     print_menu_header "安装 Nginx Proxy Manager"
     
     update_status_cache
+    
+    # 检查Docker状态
     if [ "${CACHE_STATUS["docker_installed"]}" = false ]; then
-        print_error "Docker 未安装"
+        print_error "Docker 未安装，请先安装 Docker"
         return 1
     fi
     
-    if [ "${CACHE_STATUS["npm_installed"]}" = true ]; then
-        print_warning "Nginx Proxy Manager 已安装"
-        return 0
-    fi
-    
-    # 启动 Docker 服务
-    if has_systemd && ! systemctl is-active --quiet docker 2>/dev/null; then
-        systemctl start docker || {
-            print_error "无法启动 Docker 服务"
+    if ! command_exists curl; then
+        print_warning "curl 未安装，尝试安装..."
+        apt-get update >/dev/null 2>&1
+        apt-get install -y curl >/dev/null 2>&1 || {
+            print_error "无法安装 curl"
             return 1
         }
     fi
-
-    local progress_pid=$(show_progress "正在拉取 Nginx Proxy Manager 镜像...")
-    docker pull "$NPM_IMAGE" > /dev/null 2>&1 || {
-        stop_progress "$progress_pid"
+    
+    # 检查容器是否已存在
+    if docker ps -a --format '{{.Names}}' | grep -q nginx-proxy-manager; then
+        print_warning "Nginx Proxy Manager 容器已存在"
+        
+        local container_status=$(docker inspect -f '{{.State.Status}}' nginx-proxy-manager 2>/dev/null || echo "未知")
+        printf "容器状态: $container_status\n"
+        
+        if [ "$container_status" = "running" ]; then
+            print_info "容器正在运行中，无需重复安装"
+            return 0
+        fi
+        
+        if confirm_with_timeout "是否删除现有容器并重新安装？" 10 "N"; then
+            docker stop nginx-proxy-manager 2>/dev/null || true
+            docker rm nginx-proxy-manager 2>/dev/null || true
+            print_info "已删除现有容器"
+        else
+            return 0
+        fi
+    fi
+    
+    # 检查端口占用
+    local ports=(80 81 443)
+    local port_conflicts=()
+    
+    for port in "${ports[@]}"; do
+        if ss -tuln | grep -q ":$port "; then
+            port_conflicts+=("$port")
+        fi
+    done
+    
+    if [ ${#port_conflicts[@]} -gt 0 ]; then
+        print_warning "以下端口已被占用: ${port_conflicts[*]}"
+        
+        if [ "${port_conflicts[*]}" = "80 81 443" ]; then
+            print_error "NPM所需的所有端口都被占用，可能NPM已在运行"
+            if confirm_with_timeout "是否强制停止现有服务？" 10 "N"; then
+                for port in "${ports[@]}"; do
+                    local pid=$(ss -tlnp | grep ":$port " | awk '{print $7}' | cut -d= -f2 | cut -d, -f1)
+                    if [ -n "$pid" ]; then
+                        kill -9 "$pid" 2>/dev/null && print_info "已停止占用端口 $port 的进程 (PID: $pid)"
+                    fi
+                done
+                sleep 2
+            else
+                return 1
+            fi
+        fi
+    fi
+    
+    # 定义安装步骤
+    local steps=4
+    local current_step=1
+    
+    # 步骤1: 检查并启动Docker服务
+    show_step_progress $current_step $steps "检查Docker服务" "start"
+    if has_systemd && ! systemctl is-active --quiet docker 2>/dev/null; then
+        if systemctl start docker 2>/dev/null; then
+            show_step_progress $current_step $steps "检查Docker服务" "success"
+        else
+            show_step_progress $current_step $steps "检查Docker服务" "error"
+            print_error "无法启动 Docker 服务"
+            return 1
+        fi
+    else
+        show_step_progress $current_step $steps "检查Docker服务" "success"
+    fi
+    ((current_step++))
+    
+    # 步骤2: 拉取镜像
+    show_step_progress $current_step $steps "拉取NPM镜像" "start"
+    local pull_output=$(docker pull "$NPM_IMAGE" 2>&1)
+    if [ $? -eq 0 ]; then
+        show_step_progress $current_step $steps "拉取NPM镜像" "success"
+        print_info "镜像: $NPM_IMAGE"
+        
+        # 显示镜像大小
+        local image_size=$(docker images "$NPM_IMAGE" --format "{{.Size}}" 2>/dev/null || echo "未知")
+        print_info "镜像大小: $image_size"
+    else
+        show_step_progress $current_step $steps "拉取NPM镜像" "error"
         print_error "镜像拉取失败"
-        return 1
-    }
-    stop_progress "$progress_pid"
-
-    progress_pid=$(show_progress "正在创建数据目录...")
-    mkdir -p "$NPM_DATA_DIR"/{data,letsencrypt} || {
-        stop_progress "$progress_pid"
+        printf "错误信息:\n"
+        echo "$pull_output"
+        
+        # 尝试使用备用镜像源
+        print_info "尝试使用备用镜像源..."
+        local alt_image="jc21/nginx-proxy-manager:latest"
+        if docker pull "$alt_image" 2>/dev/null; then
+            NPM_IMAGE="$alt_image"
+            print_info "使用备用镜像: $alt_image"
+            show_step_progress $current_step $steps "拉取NPM镜像" "success"
+        else
+            return 1
+        fi
+    fi
+    ((current_step++))
+    
+    # 步骤3: 创建数据目录
+    show_step_progress $current_step $steps "创建数据目录" "start"
+    if mkdir -p "$NPM_DATA_DIR"/{data,letsencrypt} 2>/dev/null; then
+        show_step_progress $current_step $steps "创建数据目录" "success"
+        
+        # 设置目录权限
+        chmod -R 755 "$NPM_DATA_DIR" 2>/dev/null || true
+        chown -R $ORIGINAL_USER:$ORIGINAL_USER "$NPM_DATA_DIR" 2>/dev/null || true
+        
+        print_info "数据目录: $NPM_DATA_DIR"
+    else
+        show_step_progress $current_step $steps "创建数据目录" "error"
         print_error "目录创建失败"
         return 1
-    }
-    stop_progress "$progress_pid"
-
-    progress_pid=$(show_progress "正在启动容器...")
-    docker run -d \
+    fi
+    ((current_step++))
+    
+    # 步骤4: 启动容器
+    show_step_progress $current_step $steps "启动NPM容器" "start"
+    
+    # 清理可能存在的旧容器
+    docker stop nginx-proxy-manager 2>/dev/null || true
+    docker rm nginx-proxy-manager 2>/dev/null || true
+    
+    # 显示启动命令
+    printf "\n${CYAN}启动命令：${NC}\n"
+    echo "docker run -d \\"
+    echo "  --name=nginx-proxy-manager \\"
+    echo "  --restart=unless-stopped \\"
+    echo "  -p 80:80 \\"
+    echo "  -p 81:81 \\"
+    echo "  -p 443:443 \\"
+    echo "  -v $NPM_DATA_DIR/data:/data \\"
+    echo "  -v $NPM_DATA_DIR/letsencrypt:/etc/letsencrypt \\"
+    echo "  $NPM_IMAGE"
+    
+    # 启动容器
+    local container_id=$(docker run -d \
         --name=nginx-proxy-manager \
         --restart=unless-stopped \
         -p 80:80 \
@@ -1052,21 +1344,108 @@ install_nginxpm() {
         -p 443:443 \
         -v "$NPM_DATA_DIR/data:/data" \
         -v "$NPM_DATA_DIR/letsencrypt:/etc/letsencrypt" \
-        "$NPM_IMAGE" > /dev/null 2>&1 || {
-            stop_progress "$progress_pid"
-            print_error "容器启动失败"
-            return 1
-        }
-    stop_progress "$progress_pid"
-
+        "$NPM_IMAGE" 2>&1)
+    
+    if [ $? -eq 0 ]; then
+        show_step_progress $current_step $steps "启动NPM容器" "success"
+        
+        # 等待容器启动
+        print_info "等待容器启动..."
+        local wait_time=0
+        while [ $wait_time -lt 30 ]; do
+            if docker ps --filter "name=nginx-proxy-manager" --filter "status=running" | grep -q nginx-proxy-manager; then
+                print_success "容器已启动并运行"
+                break
+            fi
+            printf "."
+            sleep 1
+            ((wait_time++))
+        done
+        
+        # 显示容器信息
+        printf "\n${BOLD}容器信息：${NC}\n"
+        local container_ip=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' nginx-proxy-manager 2>/dev/null || echo "未知")
+        printf "  ${GREEN}✓${NC} 容器IP: $container_ip\n"
+        
+        # 检查Web服务是否就绪
+        print_info "检查Web服务状态..."
+        if curl -s -f -o /dev/null --connect-timeout 5 http://localhost:81 2>/dev/null; then
+            print_success "Web服务已就绪"
+        else
+            print_warning "Web服务启动中，可能需要更多时间..."
+            sleep 5
+        fi
+        
+    else
+        show_step_progress $current_step $steps "启动NPM容器" "error"
+        print_error "容器启动失败"
+        printf "错误信息:\n"
+        echo "$container_id"
+        
+        # 尝试查看容器日志
+        print_info "查看容器日志："
+        docker logs nginx-proxy-manager 2>&1 | tail -20
+        
+        return 1
+    fi
+    ((current_step++))
+    
+    # 显示进度条
+    show_progress_bar $current_step $steps "NPM安装进度"
+    printf "\n\n"
+    
+    # 显示安装结果
     print_success "Nginx Proxy Manager 安装完成！"
-    print_success "Web UI: ${BOLD}http://服务器IP:81${NC}"
-    print_success "默认账号: ${BOLD}admin@example.com${NC}"
-    print_success "默认密码: ${BOLD}changeme${NC}"
-    print_warning "请首次登录后立即修改密码！"
+    
+    # 获取服务器IP
+    local server_ip=""
+    if command_exists ip; then
+        server_ip=$(ip route get 1 | awk '{print $7}' | head -1)
+    elif command_exists hostname; then
+        server_ip=$(hostname -I | awk '{print $1}')
+    fi
+    
+    printf "\n${BOLD}访问信息：${NC}\n"
+    printf "┌────────────────────────────────────────┐\n"
+    printf "│  Web管理界面: ${CYAN}http://%s:81${NC}   │\n" "${server_ip:-服务器IP}"
+    printf "│  代理HTTP端口: ${CYAN}80${NC}                    │\n"
+    printf "│  代理HTTPS端口: ${CYAN}443${NC}                   │\n"
+    printf "└────────────────────────────────────────┘\n"
+    
+    printf "\n${BOLD}默认登录凭据：${NC}\n"
+    printf "┌────────────────────────────────────────┐\n"
+    printf "│  邮箱: ${YELLOW}admin@example.com${NC}              │\n"
+    printf "│  密码: ${YELLOW}changeme${NC}                        │\n"
+    printf "└────────────────────────────────────────┘\n"
+    
+    print_warning "${BOLD}重要：首次登录后请立即修改密码！${NC}"
+    
+    # 验证安装
+    printf "\n${BOLD}验证安装结果：${NC}\n"
+    if docker ps --filter "name=nginx-proxy-manager" --filter "status=running" | grep -q nginx-proxy-manager; then
+        printf "  ${GREEN}✓${NC} NPM容器正在运行\n"
+    else
+        printf "  ${RED}✗${NC} NPM容器未运行\n"
+    fi
+    
+    # 测试端口
+    for port in 81 80 443; do
+        if ss -tln | grep -q ":$port "; then
+            printf "  ${GREEN}✓${NC} 端口 $port 已监听\n"
+        else
+            printf "  ${YELLOW}⚠${NC} 端口 $port 未监听\n"
+        fi
+    done
     
     CACHE_STATUS["last_operation"]="安装 Nginx Proxy Manager ($(date '+%H:%M'))"
     CACHE_STATUS["last_update"]=0
+    
+    # 保存配置
+    if [ -f "$CONFIG_FILE" ]; then
+        echo "NPM_DATA_DIR=\"$NPM_DATA_DIR\"" >> "$CONFIG_FILE"
+        echo "NPM_IMAGE=\"$NPM_IMAGE\"" >> "$CONFIG_FILE"
+    fi
+    
     return 0
 }
 
@@ -1265,60 +1644,82 @@ uninstall_nginxpm() {
 cleanup_failed_install() {
     print_menu_header "清理失败的安装"
     
-    printf "检测到以下组件安装失败：\n"
+    printf "检测系统状态...\n"
     update_status_cache
     
     local cleanup_list=()
     
+    # 使用更清晰的显示
+    printf "%-25s %-10s %s\n" "组件" "状态" "建议"
+    printf "%-25s %-10s %s\n" "-------------------------" "----------" "-------------------------"
+    
     if [ "${CACHE_STATUS["docker_installed"]}" = true ]; then
-        printf "  ✅ Docker 已安装\n"
+        printf "%-25s %-10s %s\n" "Docker" "✅ 已安装" "无需清理"
     else
-        printf "  ❌ Docker 安装失败或未安装\n"
+        printf "%-25s %-10s %s\n" "Docker" "❌ 未安装" "可清理"
         cleanup_list+=("docker")
     fi
     
     if [ "${CACHE_STATUS["portainer_installed"]}" = true ]; then
-        printf "  ✅ Portainer 已安装\n"
+        printf "%-25s %-10s %s\n" "Portainer" "✅ 已安装" "无需清理"
     else
-        printf "  ❌ Portainer 安装失败或未安装\n"
+        printf "%-25s %-10s %s\n" "Portainer" "❌ 未安装" "可清理"
         cleanup_list+=("portainer")
     fi
     
     if [ "${CACHE_STATUS["npm_installed"]}" = true ]; then
-        printf "  ✅ NPM 已安装\n"
+        printf "%-25s %-10s %s\n" "NPM" "✅ 已安装" "无需清理"
     else
-        printf "  ❌ NPM 安装失败或未安装\n"
+        printf "%-25s %-10s %s\n" "NPM" "❌ 未安装" "可清理"
         cleanup_list+=("npm")
     fi
     
     if [ "${CACHE_STATUS["dpanel_installed"]}" = true ]; then
-        printf "  ✅ DPanel 已安装\n"
+        printf "%-25s %-10s %s\n" "DPanel" "✅ 已安装" "无需清理"
     else
-        printf "  ❌ DPanel 安装失败或未安装\n"
+        printf "%-25s %-10s %s\n" "DPanel" "❌ 未安装" "可清理"
         cleanup_list+=("dpanel")
     fi
     
+    printf "\n"
+    
     if [ ${#cleanup_list[@]} -eq 0 ]; then
-        print_info "没有检测到失败的安装"
+        print_success "没有检测到失败的安装"
         return 0
     fi
     
-    printf "\n"
-    printf "建议清理以下失败的安装：\n"
+    printf "检测到 %d 个可能失败的安装：\n" "${#cleanup_list[@]}"
     for item in "${cleanup_list[@]}"; do
         printf "  • %s\n" "$item"
     done
     
+    printf "\n"
+    print_warning "注意：清理操作将删除相关数据，请确认已备份重要数据！"
+    
     if confirm_with_timeout "是否执行清理？" 10 "N"; then
         for item in "${cleanup_list[@]}"; do
             case $item in
-                "docker") uninstall_docker ;;
-                "portainer") uninstall_portainer ;;
-                "npm") uninstall_nginxpm ;;
-                "dpanel") uninstall_dpanel ;;
+                "docker") 
+                    printf "\n清理 Docker...\n"
+                    uninstall_docker 
+                    ;;
+                "portainer") 
+                    printf "\n清理 Portainer...\n"
+                    uninstall_portainer 
+                    ;;
+                "npm") 
+                    printf "\n清理 NPM...\n"
+                    uninstall_nginxpm 
+                    ;;
+                "dpanel") 
+                    printf "\n清理 DPanel...\n"
+                    uninstall_dpanel 
+                    ;;
             esac
         done
         print_success "清理完成！"
+    else
+        print_info "取消清理操作"
     fi
 }
 
@@ -1338,42 +1739,109 @@ menu_install_configure() {
         printf "\n"
         read -p "请选择 (0-8, ..): " choice
         
-        case $choice in
+                    case $choice in
             0)
                 print_menu_header "一键安装全部组件"
                 
-                local steps=(
-                    "安装 Docker|install_docker"
-                    "安装 Portainer|install_portainer"
-                    "安装 Nginx Proxy Manager|install_nginxpm"
-                    "安装 DPanel|install_dpanel"
+                local components=(
+                    "Docker"
+                    "Portainer" 
+                    "Nginx Proxy Manager"
+                    "DPanel"
                 )
                 
-                local failed_steps=()
+                local install_functions=(
+                    "install_docker"
+                    "install_portainer"
+                    "install_nginxpm"
+                    "install_dpanel"
+                )
                 
-                for step_info in "${steps[@]}"; do
-                    local step_name="${step_info%|*}"
-                    local step_func="${step_info#*|}"
+                local total=${#components[@]}
+                local success_count=0
+                local failed_components=()
+                
+                printf "开始一键安装 %d 个组件...\n" "$total"
+                printf "%s\n" "----------------------------------------------------------------"
+                
+                for i in "${!components[@]}"; do
+                    local comp_name="${components[$i]}"
+                    local comp_func="${install_functions[$i]}"
+                    local step_num=$((i + 1))
                     
-                    print_info "执行: $step_name"
+                    printf "\n${BOLD}步骤 %d/%d: 安装 %s${NC}\n" "$step_num" "$total" "$comp_name"
                     
-                    if ! $step_func; then
-                        print_error "$step_name 失败！"
-                        failed_steps+=("$step_name")
-                        
-                        if ! confirm_with_timeout "是否继续尝试后续安装？" 10 "N"; then
-                            break
-                        fi
-                    else
-                        print_success "$step_name 完成"
-                    fi
+                    # 显示当前进度
+            show_progress_bar $((step_num-1)) $total "总体安装进度"
+printf "\n"
+
+# 记录开始时间
+local start_time=$(date +%s)
+
+# 执行安装
+if $comp_func; then
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    print_success "$comp_name 安装成功 (耗时: ${duration}秒)"
+    ((success_count++))
+    
+    # 安装成功后显示更新后的进度
+    show_progress_bar $step_num $total "总体安装进度"
+    printf "\n"
+else
+    print_error "$comp_name 安装失败"
+    failed_components+=("$comp_name")
+    
+    # 即使失败也更新进度
+    show_progress_bar $step_num $total "总体安装进度"
+    printf "\n"
+    
+    if [ ${#failed_components[@]} -eq 1 ]; then
+        if ! confirm_with_timeout "是否继续尝试后续安装？" 10 "Y"; then
+            break
+        fi
+    fi
+fi
+                    
+                    printf "%s\n" "----------------------------------------------------------------"
                 done
                 
-                if [ ${#failed_steps[@]} -eq 0 ]; then
-                    print_success "所有组件安装完成！"
-                else
-                    print_warning "部分组件安装失败：${failed_steps[*]}"
+                # 显示总体进度
+                show_progress_bar $total $total "总体安装进度"
+                printf "\n\n"
+                
+                # 显示安装摘要
+                printf "${BOLD}安装结果摘要：${NC}\n"
+                printf "成功: ${GREEN}%d/${total}${NC}\n" "$success_count"
+                
+                if [ ${#failed_components[@]} -gt 0 ]; then
+                    printf "失败: ${RED}%d/${total}${NC}\n" "${#failed_components[@]}"
+                    printf "失败的组件: ${YELLOW}%s${NC}\n" "$(IFS=,; echo "${failed_components[*]}")"
                     print_info "请使用选项7清理失败的安装"
+                fi
+                
+                # 显示访问信息
+                if [ $success_count -gt 0 ]; then
+                    printf "\n${BOLD}已安装组件的访问信息：${NC}\n"
+                    
+                    # 检查并显示每个组件的访问信息
+                    if docker ps --format '{{.Names}}' | grep -q portainer; then
+                        printf "  • Portainer: ${CYAN}http://服务器IP:9000${NC}\n"
+                    fi
+                    
+                    if docker ps --format '{{.Names}}' | grep -q nginx-proxy-manager; then
+                        printf "  • NPM: ${CYAN}http://服务器IP:81${NC}\n"
+                        printf "     邮箱: admin@example.com 密码: changeme\n"
+                    fi
+                    
+                    if docker ps --format '{{.Names}}' | grep -q dpanel; then
+                        printf "  • DPanel: ${CYAN}http://服务器IP:7800${NC}\n"
+                    fi
+                    
+                    print_success "一键安装完成！"
+                else
+                    print_error "所有组件安装失败"
+                    print_info "请检查网络连接和系统状态"
                 fi
                 ;;
             1) install_docker ;;
@@ -1394,6 +1862,108 @@ menu_install_configure() {
             read -p "按Enter键继续..."
         fi
     done
+}
+
+# ==================== 新增：安装状态检测 ====================
+check_install_status() {
+    local component="$1"
+    
+    case $component in
+        "docker")
+            if command_exists docker; then
+                local version=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "未知")
+                print_success "✓ Docker 已安装 (版本: $version)"
+                return 0
+            else
+                print_error "✗ Docker 未安装"
+                return 1
+            fi
+            ;;
+        "portainer")
+            if docker ps -a --format '{{.Names}}' | grep -q portainer; then
+                local status=$(docker inspect -f '{{.State.Status}}' portainer 2>/dev/null || echo "未运行")
+                print_success "✓ Portainer 已安装 (状态: $status)"
+                return 0
+            else
+                print_error "✗ Portainer 未安装"
+                return 1
+            fi
+            ;;
+        "npm")
+            if docker ps -a --format '{{.Names}}' | grep -q nginx-proxy-manager; then
+                local status=$(docker inspect -f '{{.State.Status}}' nginx-proxy-manager 2>/dev/null || echo "未运行")
+                print_success "✓ Nginx Proxy Manager 已安装 (状态: $status)"
+                return 0
+            else
+                print_error "✗ Nginx Proxy Manager 未安装"
+                return 1
+            fi
+            ;;
+        "dpanel")
+            if docker ps -a --format '{{.Names}}' | grep -q dpanel; then
+                local status=$(docker inspect -f '{{.State.Status}}' dpanel 2>/dev/null || echo "未运行")
+                print_success "✓ DPanel 已安装 (状态: $status)"
+                return 0
+            else
+                print_error "✗ DPanel 未安装"
+                return 1
+            fi
+            ;;
+        "compose")
+            if command_exists docker-compose || (command_exists docker && docker compose version >/dev/null 2>&1); then
+                print_success "✓ Docker Compose 已安装"
+                return 0
+            else
+                print_error "✗ Docker Compose 未安装"
+                return 1
+            fi
+            ;;
+        *)
+            print_error "未知组件: $component"
+            return 1
+            ;;
+    esac
+}
+
+# 显示安装摘要
+show_install_summary() {
+    print_menu_header "安装完成摘要"
+    
+    local components=("docker" "portainer" "npm" "dpanel")
+    local all_success=true
+    
+    printf "${BOLD}安装结果检查：${NC}\n"
+    printf "%s\n" "----------------------------------------------------------------"
+    
+    for component in "${components[@]}"; do
+        printf "%-25s: " "$component"
+        if check_install_status "$component" >/dev/null 2>&1; then
+            printf "${GREEN}✓ 已安装${NC}\n"
+        else
+            printf "${RED}✗ 未安装${NC}\n"
+            all_success=false
+        fi
+    done
+    
+    printf "%s\n" "----------------------------------------------------------------"
+    
+    if [ "$all_success" = true ]; then
+        print_success "所有组件安装完成！"
+        
+        # 显示访问信息
+        printf "\n${BOLD}访问信息：${NC}\n"
+        printf "  • Portainer: ${CYAN}http://服务器IP:9000${NC}\n"
+        printf "  • NPM: ${CYAN}http://服务器IP:81${NC}\n"
+        printf "  • DPanel: ${CYAN}http://服务器IP:7800${NC}\n"
+        
+        printf "\n${BOLD}默认凭据：${NC}\n"
+        printf "  • NPM: admin@example.com / changeme\n"
+        printf "  • Portainer: 首次访问设置密码\n"
+        printf "  • DPanel: 首次访问设置账号\n"
+    else
+        print_warning "部分组件安装失败"
+        printf "请检查日志文件: ${GRAY}$LOG_FILE${NC}\n"
+    fi
 }
 
 # ==================== 菜单2：应用管理（完善版）====================
@@ -1919,22 +2489,22 @@ show_network_info() {
     
     # DNS服务器 - 修复printf错误
     printf "\n${BOLD}📡 DNS 服务器：${NC}\n"
-    if [ -f /etc/resolv.conf ]; then
-        local dns_count=0
-        while IFS= read -r line; do
+            if [ -f /etc/resolv.conf ]; then
+                local dns_count=0
+                while IFS= read -r line; do
             if [[ "$line" == nameserver* ]]; then
-                dns_server=$(echo "$line" | awk '{print $2}')
+                local dns_server=$(echo "$line" | awk '{print $2}')
                 ((dns_count++))
                 printf "  DNS%d: %s" "$dns_count" "$dns_server"
-                
-                # 测试DNS响应
-                if nslookup -timeout=2 baidu.com "$dns_server" >/dev/null 2>&1; then
-                    printf " ${GREEN}✓ 正常${NC}\n"
-                else
-                    printf " ${RED}✗ 异常${NC}\n"
-                fi
+            
+            # 测试DNS响应
+            if nslookup -timeout=2 baidu.com "$dns_server" >/dev/null 2>&1; then
+                printf " ${GREEN}✓ 正常${NC}\n"
+            else
+                printf " ${RED}✗ 异常${NC}\n"
             fi
-        done < /etc/resolv.conf
+        fi
+    done < /etc/resolv.conf
         
         if [ $dns_count -eq 0 ]; then
             printf "  ${YELLOW}未配置DNS服务器${NC}\n"
@@ -1946,18 +2516,18 @@ show_network_info() {
     # 公网连接测试 - 修复printf错误
     printf "\n${BOLD}🌍 公网连接：${NC}\n"
     printf "  测试到 8.8.8.8: "
-    if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
-        printf "${GREEN}✓ 正常${NC}\n"
-    else
-        printf "${RED}✗ 失败${NC}\n"
-    fi
-    
-    printf "  DNS解析测试: "
-    if host baidu.com >/dev/null 2>&1; then
-        printf "${GREEN}✓ 正常${NC}\n"
-    else
-        printf "${RED}✗ 失败${NC}\n"
-    fi
+if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+    printf "${GREEN}✓ 正常${NC}\n"
+else
+    printf "${RED}✗ 失败${NC}\n"
+fi
+
+printf "  DNS解析测试: "
+if host baidu.com >/dev/null 2>&1; then
+    printf "${GREEN}✓ 正常${NC}\n"
+else
+    printf "${RED}✗ 失败${NC}\n"
+fi
     
     printf "%s\n" "----------------------------------------------------------------"
 }
@@ -3015,6 +3585,7 @@ main() {
     
     # 创建日志目录
     mkdir -p "$(dirname "$LOG_FILE")"
+    mkdir -p "$(dirname "$CONFIG_FILE")"  # 添加这行
     touch "$LOG_FILE"
     chmod 644 "$LOG_FILE"
     
